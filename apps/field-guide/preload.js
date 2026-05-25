@@ -12,4 +12,6 @@ contextBridge.exposeInMainWorld("api", {
   getAppInfo:            ()       => ipcRenderer.invoke("fg:get-app-info"),
   // calendar export — PNG (recommended for messaging) or PDF.
   exportCalendar:        (opts)   => ipcRenderer.invoke("fg:export-calendar", opts),
+  // live Shape Rotator entries. The main process attaches any private key.
+  shapeRotatorEntries:   (opts)   => ipcRenderer.invoke("shape-rotator:entries", opts),
 });
