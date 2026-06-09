@@ -156,8 +156,25 @@ function splitLeadingTime(line) {
 // narrow day cards (the previous layout) was clipping titles after two
 // characters; pulling time off the title line frees the whole card
 // width for the words that actually identify the event.
+// Collapse consecutive identical lines within a block. The upstream Phala
+// calendar occasionally repeats a line verbatim (e.g. an "[All Day] Anarchy
+// Day…" note stored twice). Left alone that renders as an italic title PLUS a
+// duplicate sub-line, which both reads wrong and inflates the day column's
+// height (stretching every other column in the equal-height week grid). We
+// can't fix it in the JSON — the sync would overwrite it — so we dedupe at
+// render time, hardening both surfaces against any repeated upstream line.
+function dedupeAdjacentLines(lines) {
+  const out = [];
+  for (const line of lines) {
+    const prev = out[out.length - 1];
+    if (prev != null && line.trim() && prev.trim() === line.trim()) continue;
+    out.push(line);
+  }
+  return out;
+}
+
 function renderEventBlock(blockText, sources = []) {
-  const lines = blockText.split("\n").map(l => l.replace(/\s+$/, ""));
+  const lines = dedupeAdjacentLines(blockText.split("\n").map(l => l.replace(/\s+$/, "")));
   if (!lines.length) return "";
   const firstRaw = lines[0].trim();
   let { time, rest } = splitLeadingTime(firstRaw);
@@ -218,6 +235,14 @@ const CAL_CATEGORIES = [
 function eventCategory(text) {
   const t = String(text || "");
   const tbc = /\btbc\b|to be confirmed|\(tbc\)/i.test(t);
+  // Cohort convention: anything that starts at or after 4pm is a salon.
+  // This is a time-of-day rule, so it takes precedence over the text
+  // heuristics below (an evening "check point" still reads as the salon
+  // slot). All-day / untimed blocks fall through to the keyword match.
+  const timing = parseBlockTiming(t);
+  if (timing && timing.startMin >= 16 * 60) {
+    return { key: "salon", label: "Salon", tbc };
+  }
   for (const c of CAL_CATEGORIES) if (c.re.test(t)) return { key: c.key, label: c.label, tbc };
   return { key: "default", label: "", tbc };
 }
@@ -686,7 +711,7 @@ function renderDayView({ days, dayIdx, theme, weekNum, phase, transcriptMatches 
     // Event block: parse like the week renderer, but with full-width
     // typography — the day card is the entire column width, so the title
     // can be 26–32px italic without competing for space with anything.
-    const lines = it.raw.split("\n").map(l => l.replace(/\s+$/, ""));
+    const lines = dedupeAdjacentLines(it.raw.split("\n").map(l => l.replace(/\s+$/, "")));
     const firstRaw = lines[0].trim();
     let { time, rest } = splitLeadingTime(firstRaw);
     let title = rest;
