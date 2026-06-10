@@ -1393,6 +1393,10 @@
   margin: 0;
 }
 .cal-key {
+  /* now a real toggle button — reset the native chrome and let the
+   * editorial styling below carry through */
+  appearance: none; background: transparent; border: 0; cursor: pointer;
+  padding: 2px 0; margin: 0;
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -1401,7 +1405,16 @@
   letter-spacing: 0.06em;
   color: var(--ed-ink-3);
   text-transform: lowercase;
+  transition: opacity 140ms ease-out, color 140ms ease-out;
 }
+.cal-key:hover { color: var(--ed-ink-1); }
+.cal-key:focus-visible { outline: 1px solid var(--ed-rule-3); outline-offset: 3px; }
+/* Toggled-off filter: dim the key + strike the label so it reads as muted.
+ * The dot keeps just enough color to still identify the category. */
+.cal-key.is-off { opacity: 0.4; text-decoration: line-through; text-decoration-thickness: 1px; }
+.cal-key.is-off .cal-key-dot { opacity: 0.45; }
+/* A card whose category filter is toggled off is removed from the grid. */
+.cal-week .cal-event.cal-event--off { display: none; }
 .cal-key-dot { width: 10px; height: 10px; border-radius: 3px; background: var(--ed-ink-4); flex: none; }
 .cal-key[data-cat="oh"]     .cal-key-dot { background: #d98a5c; }
 .cal-key[data-cat="salon"]  .cal-key-dot { background: #c9a8d8; }
