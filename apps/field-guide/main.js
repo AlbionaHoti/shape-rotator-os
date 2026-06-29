@@ -83,6 +83,80 @@ function writeJSON(p, d) {
   fs.renameSync(tmp, p);
 }
 
+const SHAPE_ROTATOR_DEFAULT_URL = "https://shaperotator.teleport.computer";
+
+function normalizeHttpOrigin(raw, fallback = SHAPE_ROTATOR_DEFAULT_URL) {
+  try {
+    const u = new URL(String(raw || fallback));
+    return u.origin;
+  } catch {
+    return fallback;
+  }
+}
+
+function shapeRotatorBaseUrl() {
+  return normalizeHttpOrigin(
+    process.env.SHAPE_ROTATOR_URL
+      || process.env.ROUTER_URL
+      || process.env.SHAPE_ROTATOR_MCP_URL
+      || process.env.ROUTER_MCP_URL
+      || SHAPE_ROTATOR_DEFAULT_URL
+  );
+}
+
+function shapeRotatorKey() {
+  const direct = process.env.SHAPE_ROTATOR_KEY
+    || process.env.ROUTER_KEY
+    || process.env.TELEPORT_ROUTER_KEY;
+  if (direct && String(direct).trim()) return String(direct).trim();
+
+  const mcpUrl = process.env.SHAPE_ROTATOR_MCP_URL || process.env.ROUTER_MCP_URL;
+  if (mcpUrl) {
+    try {
+      return new URL(mcpUrl).searchParams.get("key") || "";
+    } catch {}
+  }
+  return "";
+}
+
+async function fetchShapeRotatorJson(pathname, params = {}) {
+  const key = shapeRotatorKey();
+  const baseUrl = shapeRotatorBaseUrl();
+  if (!key) {
+    return { ok: false, reason: "missing_key", sourceUrl: baseUrl };
+  }
+
+  const url = new URL(pathname, baseUrl);
+  url.searchParams.set("key", key);
+  for (const [k, v] of Object.entries(params)) {
+    if (v == null || v === "") continue;
+    url.searchParams.set(k, String(v));
+  }
+
+  try {
+    const r = await fetch(url, { headers: { Accept: "application/json" } });
+    let body = null;
+    try { body = await r.json(); } catch {}
+    if (!r.ok) {
+      return {
+        ok: false,
+        reason: "http_error",
+        status: r.status,
+        detail: body?.error || body?.message || `HTTP ${r.status}`,
+        sourceUrl: baseUrl,
+      };
+    }
+    return { ok: true, body, sourceUrl: baseUrl, fetchedAt: Date.now() };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: "request_failed",
+      detail: String(e && e.message || e),
+      sourceUrl: baseUrl,
+    };
+  }
+}
+
 function createWindow() {
   const ws = readJSON(WINDOW_STATE, { width: 1600, height: 1000 });
   // Bounds-validate the saved x/y against currently-attached displays —
@@ -148,9 +222,34 @@ ipcMain.handle("env:get", async () => ({
     || process.env.SRWK_SERVER
     || "http://127.0.0.1:7777",
   mode: process.env.SRWK_ROLE === "bench" ? "bench" : "visualizer",
+  shapeRotatorUrl: shapeRotatorBaseUrl(),
+  shapeRotatorHasKey: !!shapeRotatorKey(),
 }));
 ipcMain.handle("shell:openExternal", async (_e, url) => {
   if (typeof url === "string" && /^https?:\/\//i.test(url)) shell.openExternal(url);
+});
+ipcMain.handle("shape-rotator:entries", async (_e, opts = {}) => {
+  const limit = Math.max(1, Math.min(100, Number(opts.limit) || 50));
+  const params = { limit };
+  if (opts.cursor) params.cursor = opts.cursor;
+  if (opts.offset) params.offset = opts.offset;
+  if (Array.isArray(opts.tags) && opts.tags.length) params.tags = opts.tags.join(",");
+  if (opts.author) params.author = opts.author;
+
+  const res = await fetchShapeRotatorJson("/api/entries", params);
+  if (!res.ok) return { ...res, entries: [] };
+
+  const body = res.body || {};
+  return {
+    ok: true,
+    entries: Array.isArray(body.entries) ? body.entries : [],
+    total: body.total ?? null,
+    limit: body.limit ?? limit,
+    offset: body.offset ?? null,
+    nextCursor: body.nextCursor ?? null,
+    sourceUrl: res.sourceUrl,
+    fetchedAt: res.fetchedAt,
+  };
 });
 
 // ─── electron-updater (release-driven app binary updates) ────────────

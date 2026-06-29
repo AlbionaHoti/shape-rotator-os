@@ -31,17 +31,19 @@ const ALCHEMY_MODES   = ["feed", "shapes", "pulse", "constellation", "calendar",
 const WEEKS_TOTAL = 10;
 const WEEK_NOW = 1; // TODO: bump weekly, or derive from a cohort start date.
 
-// GitHub event refresh cadence. 60 req/hr unauth limit; we fetch one
-// request per tracked repo per refresh cycle. 14 teams × 1 repo each
-// → 14 reqs every 10 min = 84/hr ⇒ stay within budget at 12 min idle
-// with a single repo per team.
-const FEED_REFRESH_MS = 12 * 60 * 1000;
+// Feed cadence is split by source. Shape Rotator entries are first-party
+// and cheap to poll; GitHub still has the unauthenticated 60 req/hr budget.
+const SHAPE_ROTATOR_REFRESH_MS = 60 * 1000;
+const GITHUB_REFRESH_MS = 12 * 60 * 1000;
+const FEED_REFRESH_MS = SHAPE_ROTATOR_REFRESH_MS;
 
 // Where the cohort-data markdown lives. Profile tab surfaces a link to
 // each team's record so participants can edit it directly. Hardcoded
 // for now — if this repo is ever renamed or the cohort-data dir moves
 // to a separate repo (D4 from the spec walkthrough), update this.
-const COHORT_DATA_REPO = "https://github.com/dmarzzz/shape-rotator-field-guide";
+const COHORT_DATA_REPO = "https://github.com/AlbionaHoti/shape-rotator-field-guide";
+const COHORT_DATA_OWNER = "AlbionaHoti";
+const COHORT_DATA_NAME = "shape-rotator-field-guide";
 const COHORT_DATA_BRANCH = "main";
 function teamRecordEditUrl(record_id) {
   return `${COHORT_DATA_REPO}/edit/${COHORT_DATA_BRANCH}/cohort-data/teams/${record_id}.md`;
@@ -65,6 +67,9 @@ const state = {
   profile: null,       // local-only: { user, editor state, ... }
   events: [],          // normalized feed items, latest-first
   fetchedAt: 0,
+  githubFetchedAt: 0,
+  shapeRotatorFetchedAt: 0,
+  shapeRotatorStatus: "shape rotator waiting",
   isFetching: false,
   unsubscribe: null,
   refreshTimer: null,
@@ -1747,7 +1752,7 @@ function renderDetail(recordId) {
   const teamPeople = (state.cohort.people || []).filter(p => p.team === recordId);
 
   const linksRow = renderDetailLinks(team.links || {});
-  const editUrl = `https://github.com/dmarzzz/shape-rotator-field-guide/edit/main/cohort-data/teams/${encodeURIComponent(recordId)}.md?quick_pull=1`;
+  const editUrl = `${COHORT_DATA_REPO}/edit/${COHORT_DATA_BRANCH}/cohort-data/teams/${encodeURIComponent(recordId)}.md?quick_pull=1`;
 
   state.canvas.innerHTML = `
     <header class="alch-detail-bar">
@@ -2055,6 +2060,9 @@ function loadEventsCache() {
       if (parsed && Array.isArray(parsed.items)) {
         state.events = parsed.items;
         state.fetchedAt = Number(parsed.fetchedAt) || 0;
+        state.githubFetchedAt = Number(parsed.githubFetchedAt) || state.fetchedAt || 0;
+        state.shapeRotatorFetchedAt = Number(parsed.shapeRotatorFetchedAt) || 0;
+        state.shapeRotatorStatus = parsed.shapeRotatorStatus || state.shapeRotatorStatus;
       }
     } catch {}
   }
@@ -2063,26 +2071,30 @@ function saveEventsCache() {
   try {
     localStorage.setItem(EVENTS_LS_KEY, JSON.stringify({
       fetchedAt: state.fetchedAt,
+      githubFetchedAt: state.githubFetchedAt,
+      shapeRotatorFetchedAt: state.shapeRotatorFetchedAt,
+      shapeRotatorStatus: state.shapeRotatorStatus,
       items: state.events.slice(0, 200),  // cap cache
     }));
   } catch {}
 }
 
-// ─── github scraper ─────────────────────────────────────────────────
-// Fetch /events for each tracked repo, normalize into feed items.
-// Unauthenticated; the cohort fits within the 60-req/hr budget.
+// ─── feed adapters ──────────────────────────────────────────────────
+// Source 1: live Shape Rotator entries through the Electron main process.
+// Source 2: GitHub /events for each tracked repo. Unauthenticated; the
+// cohort fits within the 60-req/hr budget at the slower cadence above.
 const GH_REPO_RE = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/;
 
 async function refreshFeed({ source = "auto", force = false } = {}) {
   if (state.isFetching) return;
-  const fresh = Date.now() - state.fetchedAt < FEED_REFRESH_MS;
-  if (fresh && !force && state.events.length > 0) {
+  const now = Date.now();
+  const shapeFresh = now - state.shapeRotatorFetchedAt < SHAPE_ROTATOR_REFRESH_MS;
+  const githubFresh = now - state.githubFetchedAt < GITHUB_REFRESH_MS;
+  if (shapeFresh && githubFresh && !force && state.events.length > 0) {
     paintFeedMeta();
     return;
   }
-  // Single source: every team's canonical `links.repo` from the
-  // cohort.surface bundle. Dedupe by repo string in case two teams
-  // ever share a monorepo.
+
   const seen = new Set();
   const repos = [];
   for (const t of state.cohort?.teams || []) {
@@ -2091,31 +2103,129 @@ async function refreshFeed({ source = "auto", force = false } = {}) {
     seen.add(repo);
     repos.push({ team_id: t.record_id, repo });
   }
-  if (repos.length === 0) { paintFeedMeta(); return; }
+  if (repos.length === 0) state.githubFetchedAt = Date.now();
+
   state.isFetching = true;
-  paintFeedMeta(`fetching · ${repos.length} repos · ${source}`);
+  paintFeedMeta(`fetching · live shape rotator · ${repos.length} repos · ${source}`);
   const collected = [];
-  for (const { team_id, repo } of repos) {
-    try {
-      const items = await fetchGithubRepoEvents(repo, team_id);
-      collected.push(...items);
-    } catch (e) {
-      console.warn(`[alch.feed] github fetch ${repo}:`, e?.message || e);
-    }
+
+  if (force || !shapeFresh) {
+    const shapeItems = await fetchShapeRotatorEvents();
+    collected.push(...shapeItems);
   }
+
+  if ((force || !githubFresh) && repos.length > 0) {
+    for (const { team_id, repo } of repos) {
+      try {
+        const items = await fetchGithubRepoEvents(repo, team_id);
+        collected.push(...items);
+      } catch (e) {
+        console.warn(`[alch.feed] github fetch ${repo}:`, e?.message || e);
+      }
+    }
+    state.githubFetchedAt = Date.now();
+  }
+
   // Merge with existing cache, dedupe by id, sort latest-first, cap.
   const byId = new Map();
   for (const it of [...collected, ...state.events]) {
     if (!byId.has(it.id)) byId.set(it.id, it);
   }
   state.events = Array.from(byId.values()).sort((a, b) => (b.at_ms || 0) - (a.at_ms || 0)).slice(0, 200);
-  state.fetchedAt = Date.now();
+  state.fetchedAt = Math.max(state.shapeRotatorFetchedAt, state.githubFetchedAt, Date.now());
   state.isFetching = false;
   saveEventsCache();
   if (state.mode === "feed") {
     renderFeed();
     wireFeedInteractions();
   }
+}
+
+async function fetchShapeRotatorEvents() {
+  if (!window.api?.shapeRotatorEntries) {
+    state.shapeRotatorStatus = "shape rotator bridge unavailable";
+    state.shapeRotatorFetchedAt = Date.now();
+    return [];
+  }
+
+  try {
+    const resp = await window.api.shapeRotatorEntries({ limit: 50 });
+    state.shapeRotatorFetchedAt = Number(resp?.fetchedAt) || Date.now();
+    if (!resp?.ok) {
+      state.shapeRotatorStatus = resp?.reason === "missing_key"
+        ? "shape rotator key missing"
+        : `shape rotator ${resp?.status || resp?.reason || "offline"}`;
+      return [];
+    }
+    const entries = Array.isArray(resp.entries) ? resp.entries : [];
+    state.shapeRotatorStatus = `${entries.length} shape rotator lines`;
+    return entries.map((entry) => normalizeShapeRotatorEntry(entry, resp.sourceUrl)).filter(Boolean);
+  } catch (e) {
+    state.shapeRotatorStatus = "shape rotator request failed";
+    state.shapeRotatorFetchedAt = Date.now();
+    console.warn("[alch.feed] shape rotator fetch:", e?.message || e);
+    return [];
+  }
+}
+
+function normalizeShapeRotatorEntry(entry, sourceUrl) {
+  if (!entry || typeof entry !== "object") return null;
+  const rawId = entry.id || entry.entry_id || `${entry.timestamp || ""}:${entry.summary || entry.content || ""}`;
+  const id = `shape:${rawId}`;
+  const at_ms = normalizeFeedTimestamp(entry.timestamp || entry.createdAt || entry.updatedAt || entry.publishAt);
+  const actor = entry.authorDisplayName || entry.displayName || entry.handle || entry.author || "shape rotator";
+  const summary = firstFeedLine(entry.summary || entry.content || entry.oneliner || "shape rotator update");
+  const tags = Array.isArray(entry.tags) ? entry.tags.map(String) : [];
+  const channel = entry.channelName || entry.channel || entry.channel_id || entry.channelId || "shape rotator";
+  const url = entry.id
+    ? `${sourceUrl || "https://shaperotator.teleport.computer"}/entry?id=${encodeURIComponent(entry.id)}`
+    : (sourceUrl || "https://shaperotator.teleport.computer");
+  return {
+    id,
+    source: "shape",
+    repo: "shaperotator.teleport.computer",
+    team_id: inferTeamFromEntry(entry, tags),
+    type: "ShapeRotatorEntry",
+    actor,
+    at_ms,
+    summary,
+    url,
+    channel,
+    tags,
+  };
+}
+
+function normalizeFeedTimestamp(v) {
+  if (typeof v === "number" && Number.isFinite(v)) return v < 1e12 ? v * 1000 : v;
+  if (typeof v === "string" && v.trim()) {
+    const numeric = Number(v);
+    if (Number.isFinite(numeric)) return numeric < 1e12 ? numeric * 1000 : numeric;
+    const parsed = Date.parse(v);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return Date.now();
+}
+
+function firstFeedLine(s) {
+  return String(s || "")
+    .replace(/\r/g, "")
+    .split("\n")
+    .map(line => line.replace(/^#+\s*/, "").trim())
+    .find(Boolean)
+    ?.slice(0, 180) || "shape rotator update";
+}
+
+function inferTeamFromEntry(entry, tags) {
+  const teamIds = new Set((state.cohort?.teams || []).map(t => t.record_id));
+  for (const tag of tags) {
+    const t = String(tag).toLowerCase();
+    if (teamIds.has(t)) return t;
+  }
+  const haystack = `${entry.summary || ""} ${entry.content || ""}`.toLowerCase();
+  for (const id of teamIds) {
+    if (haystack.includes(id)) return id;
+  }
+  return null;
 }
 
 async function fetchGithubRepoEvents(repo, team_id) {
@@ -2219,6 +2329,10 @@ function teamLabel(rid) {
   const t = teamByRecordId(rid);
   return t ? t.name : rid || "—";
 }
+function feedScopeLabel(ev) {
+  if (ev?.source === "shape") return ev.channel || teamLabel(ev.team_id) || "shape rotator";
+  return teamLabel(ev?.team_id);
+}
 function relativeTime(ms) {
   const diff = Date.now() - ms;
   if (!Number.isFinite(diff)) return "—";
@@ -2232,7 +2346,7 @@ function relativeTime(ms) {
   return `${d}d ago`;
 }
 function feedSourceGlyph(src) {
-  return src === "github" ? "◇" : src === "transcript" ? "❍" : "·";
+  return src === "shape" ? "◆" : src === "github" ? "◇" : src === "transcript" ? "❍" : "·";
 }
 
 function renderFeed() {
@@ -2246,7 +2360,7 @@ function renderFeed() {
         <p class="alch-feed-sub" id="alch-feed-meta"></p>
       </div>
       <div class="alch-feed-actions">
-        <button id="alch-feed-refresh" class="alch-feed-btn" type="button" title="re-fetch from github">
+        <button id="alch-feed-refresh" class="alch-feed-btn" type="button" title="re-fetch live sources">
           <span aria-hidden="true">↻</span>
           <span>refresh</span>
         </button>
@@ -2261,7 +2375,7 @@ function renderFeed() {
         <div class="alch-feed-empty-title">no repos tracked yet</div>
         <div class="alch-feed-empty-sub">
           go to <button class="alch-link-btn" data-go="profile">profile</button> to register
-          your team's github repos. activity will populate here within a few seconds.
+          your team's github repos. shape rotator lines can still appear when the live key is configured.
         </div>
       </div>
     `;
@@ -2270,15 +2384,15 @@ function renderFeed() {
       <div class="alch-feed-empty">
         <div class="alch-feed-empty-glyph" aria-hidden="true">⊙</div>
         <div class="alch-feed-empty-title">tracking ${repos.length} ${repos.length === 1 ? "repo" : "repos"} · no events yet</div>
-        <div class="alch-feed-empty-sub">github is being polled. fresh activity shows up here.</div>
+        <div class="alch-feed-empty-sub">shape rotator + github are being polled. fresh activity shows up here.</div>
       </div>
     `;
   } else {
     body = `<ul class="alch-feed-list">${items.map(renderFeedItem).join("")}</ul>`;
     body += `
       <p class="alch-callout"><strong>feed · v0.1</strong><br/>
-      Github events from your registered repos. Transcripts join the feed once swf-node's
-      hivemind sink lands (issue #93). Add or remove repos in the <strong>profile</strong> tab.</p>
+      Shape Rotator lines come from shaperotator.teleport.computer through the Electron bridge.
+      Github events from registered repos remain as backup context.</p>
     `;
   }
   state.canvas.innerHTML = head + body;
@@ -2286,7 +2400,8 @@ function renderFeed() {
 }
 
 function renderFeedItem(ev) {
-  const teamName = teamLabel(ev.team_id);
+  const teamName = feedScopeLabel(ev);
+  const sourceName = ev.source === "shape" ? (ev.repo || "shaperotator.teleport.computer") : (ev.repo || "");
   const sourceClass = `is-${ev.source}`;
   return `
     <li class="alch-feed-item ${sourceClass}" data-event-id="${escHtml(ev.id)}" data-url="${escHtml(ev.url || "")}">
@@ -2295,7 +2410,7 @@ function renderFeedItem(ev) {
         <div class="alch-feed-headline">
           <span class="alch-feed-team">${escHtml(teamName)}</span>
           <span class="alch-feed-sep">·</span>
-          <span class="alch-feed-repo">${escHtml(ev.repo || "")}</span>
+          <span class="alch-feed-repo">${escHtml(sourceName)}</span>
         </div>
         <div class="alch-feed-summary">
           <span class="alch-feed-actor">${escHtml(ev.actor || "")}</span>
@@ -2311,13 +2426,14 @@ function paintFeedMeta(override) {
   const meta = document.getElementById("alch-feed-meta");
   if (!meta) return;
   const repos = (state.cohort?.teams || []).filter(t => GH_REPO_RE.test(String(t?.links?.repo || "").trim())).length;
+  const shapeStatus = state.shapeRotatorStatus || "shape rotator waiting";
   if (override) { meta.textContent = override; return; }
   if (state.isFetching) {
     meta.textContent = `fetching…`;
   } else if (state.fetchedAt > 0) {
-    meta.textContent = `${state.events.length} events · ${repos} ${repos === 1 ? "repo" : "repos"} tracked · last fetched ${relativeTime(state.fetchedAt)}`;
+    meta.textContent = `${state.events.length} lines · ${shapeStatus} · ${repos} ${repos === 1 ? "repo" : "repos"} tracked · last fetched ${relativeTime(state.fetchedAt)}`;
   } else {
-    meta.textContent = `${repos} ${repos === 1 ? "repo" : "repos"} tracked · waiting on first fetch`;
+    meta.textContent = `${shapeStatus} · ${repos} ${repos === 1 ? "repo" : "repos"} tracked · waiting on first fetch`;
   }
 }
 
@@ -2884,8 +3000,8 @@ function submitEditAsPR() {
   const result = document.getElementById("alch-submit-pr-result");
   if (!result) return;
   const p = state.profile;
-  const owner  = "dmarzzz";
-  const repo   = "shape-rotator-field-guide";
+  const owner  = COHORT_DATA_OWNER;
+  const repo   = COHORT_DATA_NAME;
   const branch = "main";
 
   // ADD mode → github /new/ URL with prefilled content.
@@ -3002,4 +3118,3 @@ function formatDiffValue(v) {
 function escAttr(s) {
   return escHtml(s).replace(/"/g, "&quot;");
 }
-

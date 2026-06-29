@@ -37,6 +37,14 @@ npm run field-guide
 
 You'll need swf-node running on `127.0.0.1:7777` (default) for atlas / network / search; alchemy works offline against the bundled cohort fixture.
 
+To pull live alchemy feed lines from Shape Rotator, start the app with a private key in the Electron main process:
+
+```bash
+SHAPE_ROTATOR_URL=https://shaperotator.teleport.computer SHAPE_ROTATOR_KEY=<key> npm run field-guide
+```
+
+The renderer never receives the key. It asks the main process for sanitized `/api/entries` results and falls back to GitHub repo activity when the key is missing.
+
 ## edit your record
 
 Open the app → profile tab → pick `EDIT` (existing record) or `ADD` (new). Submit opens a GitHub PR against this repo — once merged, run `npm run publish:cohort` to push the new surface bundles to your swf-node.
